@@ -1,15 +1,10 @@
 """
 Chat API — דור ה-WHY
 Vercel Serverless Function (Python runtime)
-RAG + GPT-4o in one call
+RAG via /api/query + GPT-4o
 """
 from http.server import BaseHTTPRequestHandler
-import json, os, base64, math
-import numpy as np
-from openai import OpenAI
-
-_CHUNKS = None
-_EMBEDDINGS = None
+import json, os, urllib.request, urllib.error
 
 SYSTEM_PROMPT = """אתה "דור ה-WHY" — בוט פוליטי ישראלי שעוזר לאזרחים לבנות עמדה מבוססת עובדות.
 
@@ -41,27 +36,41 @@ SYSTEM_PROMPT = """אתה "דור ה-WHY" — בוט פוליטי ישראלי �
 - עברית בלבד, סגנון חכם ולקוני"""
 
 
-def _load():
-    global _CHUNKS, _EMBEDDINGS
-    if _CHUNKS is not None:
-        return _CHUNKS, _EMBEDDINGS
-    data_path = os.path.join(os.path.dirname(__file__), "..", "data", "chunks.json")
-    with open(data_path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    chunks, embeddings = [], []
-    for item in raw:
-        emb = np.frombuffer(base64.b64decode(item["emb"]), dtype=np.float32)
-        embeddings.append(emb)
-        chunks.append({k: item[k] for k in ("text","source","title","date","url")})
-    _CHUNKS = chunks
-    _EMBEDDINGS = np.stack(embeddings)
-    return _CHUNKS, _EMBEDDINGS
+def call_query_api(message, host):
+    """Call the /api/query endpoint on the same Vercel deployment."""
+    payload = json.dumps({"query": message, "n_results": 5}).encode()
+    req = urllib.request.Request(
+        f"{host}/api/query",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        return {"context": "", "sources": [], "error": str(e)}
 
 
-def cosine_sim(q, matrix):
-    q_n = q / (np.linalg.norm(q) + 1e-9)
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9
-    return (matrix / norms) @ q_n
+def call_openai(api_key, messages):
+    """Call OpenAI chat completions via raw HTTP (no extra deps)."""
+    payload = json.dumps({
+        "model": "gpt-4o",
+        "messages": messages,
+        "temperature": 0.3,
+        "max_tokens": 1200
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
 
 
 class handler(BaseHTTPRequestHandler):
@@ -88,50 +97,39 @@ class handler(BaseHTTPRequestHandler):
             return self._json({"error": "OPENAI_API_KEY not set"}, 500)
 
         try:
-            client = OpenAI(api_key=api_key)
-            chunks, embeddings = _load()
+            # ── Step 1: RAG retrieval via /api/query ──
+            host = os.environ.get("VERCEL_URL", "")
+            if host:
+                host = f"https://{host}"
+            else:
+                host = "https://dor-ha-why-rag.vercel.app"
 
-            # ── RAG: embed query ──
-            emb_resp = client.embeddings.create(
-                model="text-embedding-3-small", input=[message]
-            )
-            q_vec = np.array(emb_resp.data[0].embedding, dtype=np.float32)
+            rag_data = call_query_api(message, host)
+            context  = rag_data.get("context", "")
+            sources  = rag_data.get("sources", [])
 
-            # ── RAG: top-5 chunks ──
-            scores = cosine_sim(q_vec, embeddings)
-            top_idx = np.argsort(scores)[::-1][:5]
-
-            context_parts, sources = [], []
-            for idx in top_idx:
-                score = float(scores[idx])
-                if score < 0.3:
-                    continue
-                c = chunks[idx]
-                context_parts.append(f"[{c['source']}]\n{c['text']}")
-                sources.append({"source": c["source"], "title": c["title"],
-                                 "score": round(score, 3), "url": c["url"]})
-
+            # ── Step 2: Build prompt ──
             context_block = ""
-            if context_parts:
-                context_block = "\n\n## נתונים רלוונטיים ממאגר המקורות:\n"
-                context_block += "\n\n---\n".join(context_parts)
-                context_block += "\n\n---\nהשתמש בנתונים אלו בתשובתך. ציין מקורות בצורה מדויקת."
+            if context:
+                context_block = (
+                    "\n\n## נתונים רלוונטיים ממאגר המקורות:\n"
+                    + context
+                    + "\n\n---\nהשתמש בנתונים אלו בתשובתך. ציין מקורות בצורה מדויקת."
+                )
 
-            # ── GPT-4o ──
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT + context_block},
-                *[m for m in history[-8:] if m.get("role") in ("user","assistant")],
+                *[m for m in history[-8:] if m.get("role") in ("user", "assistant")],
                 {"role": "user", "content": message},
             ]
 
-            completion = client.chat.completions.create(
-                model="gpt-4o", messages=messages,
-                temperature=0.3, max_tokens=1200
-            )
+            # ── Step 3: GPT-4o ──
+            completion = call_openai(api_key, messages)
+            reply = completion["choices"][0]["message"]["content"]
 
             self._json({
-                "reply":  completion.choices[0].message.content,
-                "sources": sources,
+                "reply":      reply,
+                "sources":    sources,
                 "rag_chunks": len(sources),
             })
 
@@ -151,4 +149,5 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *args): pass
+    def log_message(self, *args):
+        pass
